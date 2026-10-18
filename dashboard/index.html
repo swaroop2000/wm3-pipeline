@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WM-3 Live Status</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2430; --mute:#6b7685; --line:#e3e7ec;
+          --ok:#1f9d55; --warn:#d98b00; --bad:#d64545; --accent:#2e5c8a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:20px 16px 60px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:0 0 10px; }
+  .sub { color:var(--mute); font-size:13px; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); margin:16px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .light { display:flex; align-items:center; gap:12px; font-size:18px; font-weight:600; }
+  .dot { width:18px; height:18px; border-radius:50%; background:var(--mute); flex:none; }
+  .ok .dot{background:var(--ok)} .warn .dot{background:var(--warn)} .bad .dot{background:var(--bad)}
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:14px; }
+  .kv b { color:var(--mute); font-weight:500; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  .tablewrap { overflow-x:auto; }
+  .pill { padding:1px 8px; border-radius:10px; font-size:12px; color:#fff; }
+  .p-ok{background:var(--ok)} .p-warn{background:var(--warn)} .p-flagged{background:var(--warn)} .p-failed{background:var(--bad)} .p-running{background:var(--accent)} .p-late{background:var(--warn)}
+  .events { max-height:260px; overflow:auto; font:12px/1.5 ui-monospace,Menlo,monospace; }
+  .e-error{color:var(--bad)} .e-warn{color:var(--warn)}
+  select { font:inherit; padding:4px 6px; margin-right:6px; }
+  #map { width:100%; border-radius:8px; margin-top:10px; border:1px solid var(--line); background:#eee; min-height:60px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>WeatherMesh-3 live pipeline</h1>
+  <div class="sub">Live forecast from WindBorne's open WM-3 weights, started from NOAA GFS, re-run every 6 hours on one RTX 4090.</div>
+  <div class="sub">GFS 0.25° in, WM-3 forecast out, every 6 hours. Page refreshes every 30 s. <span id="loaded"></span></div>
+
+  <div class="grid">
+    <div class="card" id="lightcard"><div class="light"><span class="dot"></span><span id="light">Loading…</span></div>
+      <div class="sub" id="lightwhy"></div></div>
+    <div class="card"><h2>Now</h2><div class="kv" id="now"></div></div>
+    <div class="card"><h2>Machine</h2><div class="kv" id="machine"></div></div>
+  </div>
+
+  <div class="card"><h2>Forecast cycles</h2><div class="tablewrap"><table id="runs"></table></div></div>
+
+  <div class="grid">
+    <div class="card"><h2>Inference time per cycle (s)</h2><canvas id="chart" height="180"></canvas></div>
+    <div class="card"><h2>Recent events</h2><div class="events" id="events"></div></div>
+  </div>
+
+  <div class="card"><h2>Forecast maps</h2>
+    <select id="selCycle"></select><select id="selMap"></select>
+    <img id="map" alt="Pick a cycle and map">
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let chart, runsCache = [];
+const ago = s => s < 90 ? `${Math.round(s)} s ago` : s < 5400 ? `${Math.round(s/60)} min ago` : `${(s/3600).toFixed(1)} h ago`;
+const kv = (el, rows) => el.innerHTML = rows.map(([k,v]) => `<b>${k}</b><span>${v ?? "–"}</span>`).join("");
+async function getJSON(p) { const r = await fetch(p + "?t=" + Date.now(), {cache:"no-store"}); if (!r.ok) throw new Error(p + " " + r.status); return r.json(); }
+
+function cycleDue(c) { // GFS cycle "YYYYMMDDHH" -> expect results ~6 h after the cycle time
+  const d = Date.UTC(+c.slice(0,4), +c.slice(4,6)-1, +c.slice(6,8), +c.slice(8,10));
+  return (Date.now() - d) / 3600e3;
+}
+
+function light(status, runs) {
+  const age = (Date.now() - Date.parse(status.heartbeat)) / 1000, beat = status.heartbeat_every_sec || 300;
+  const last = [...runs].reverse().find(r => ["ok", "flagged", "warn"].includes(r.status));
+  const sinceOk = last ? cycleDue(last.cycle) : Infinity;
+  let cls = "ok", txt = "Healthy", why = `Heartbeat ${ago(age)}.`;
+  if (age > 3 * beat) { cls = "bad"; txt = "Pipeline DOWN"; why = `No heartbeat for ${ago(age)} (expected every ${beat/60} min). The pod or script has stopped.`; }
+  else if (status.state === "failed" || (runs.length && runs[runs.length-1].status === "failed")) { cls = "bad"; txt = "Last cycle FAILED"; why = status.last_error?.msg || "See events."; }
+  else if (runs.length && ["flagged", "warn"].includes(runs[runs.length-1].status)) { cls = "warn"; txt = "Last cycle flagged"; why = "Forecast published, but a soft check needs review: " + ((runs[runs.length-1].checks || {}).failed || []).slice(0, 2).join("; "); }
+  else if (age > 1.5 * beat) { cls = "warn"; txt = "Heartbeat late"; }
+  else if (!last) { cls = "warn"; txt = "Waiting for first forecast"; why = `Pipeline is up (${status.step || status.state}).`; }
+  else if (sinceOk > 13) { cls = "warn"; txt = "Forecast is stale"; why = `Newest good forecast is from a cycle ${sinceOk.toFixed(1)} h old.`; }
+  $("lightcard").className = "card " + cls; $("light").textContent = txt; $("lightwhy").textContent = why;
+}
+
+function renderRuns(runs) {
+  const rows = [...runs].reverse().slice(0, 40);
+  $("runs").innerHTML = "<tr><th>Cycle (UTC)</th><th>Status</th><th>Download</th><th>Prep</th><th>Inference</th><th>Write+upload</th><th>Checks</th><th>24 h error z500 (model / persist)</th><th>Files</th></tr>" +
+    rows.map(r => { const t = r.timings || {}, c = r.checks || {};
+      const f = x => x == null ? "–" : x.toFixed(1) + " s";
+      return `<tr><td>${r.cycle}</td><td><span class="pill p-${r.status}" title="${(c.failed||[]).slice(0,8).join('\n')}">${r.status}</span></td>
+        <td>${f(t.download_s)}</td><td>${f(t.preprocess_s)}</td><td>${f(t.inference_s)}</td>
+        <td>${f((t.write_s||0)+(t.upload_s||0))}</td>
+        <td title="${(c.failed||[]).join(', ')}">${c.passed ?? "–"}/${c.total ?? "–"}</td>
+        <td>${r.skill && r.skill["24"] ? `${r.skill["24"].z500} m / ${r.skill["24"].persist_z500} m` : (r.skill && r.skill["6"] ? `6 h: ${r.skill["6"].z500} / ${r.skill["6"].persist_z500} m` : (r.skill && r.skill["72"] ? `72 h: ${r.skill["72"].z500} / ${r.skill["72"].persist_z500} m` : (r.status === "failed" ? "–" : "not rated yet")))}</td>
+        <td>${r.outputs_prefix ? `<a href="${r.outputs_prefix}manifest.json">manifest</a> · <a href="${r.outputs_prefix}checks.json">checks</a>` : "–"}</td></tr>`; }).join("");
+  const ok = runs.filter(r => r.timings?.inference_s != null);
+  const data = { labels: ok.map(r => r.cycle.slice(4,8) + " " + r.cycle.slice(8) + "z"),
+                 datasets: [{ label: "inference s", data: ok.map(r => r.timings.inference_s), borderColor: "#2e5c8a", tension: .2 }] };
+  if (!chart) chart = new Chart($("chart"), { type: "line", data, options: { plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}} } });
+  else { chart.data = data; chart.update(); }
+}
+
+function renderMaps(runs) {
+  const withMaps = runs.filter(r => r.maps && r.maps.length).reverse();
+  const keep = $("selCycle").value;
+  $("selCycle").innerHTML = withMaps.map(r => `<option>${r.cycle}</option>`).join("");
+  if (keep && withMaps.some(r => r.cycle === keep)) $("selCycle").value = keep;
+  fillMapList();
+}
+function fillMapList() {
+  const r = runsCache.find(x => x.cycle === $("selCycle").value); if (!r) return;
+  const keep = $("selMap").value;
+  $("selMap").innerHTML = r.maps.map(m => `<option>${m}</option>`).join("");
+  if (keep && r.maps.includes(keep)) $("selMap").value = keep;
+  $("map").src = r.outputs_prefix + "maps/" + $("selMap").value;
+}
+$("selCycle").onchange = fillMapList;
+$("selMap").onchange = () => { const r = runsCache.find(x => x.cycle === $("selCycle").value); $("map").src = r.outputs_prefix + "maps/" + $("selMap").value; };
+
+async function refresh() {
+  try {
+    const [status, runs] = await Promise.all([getJSON("status.json"), getJSON("runs.json").catch(() => [])]);
+    runsCache = runs;
+    light(status, runs);
+    kv($("now"), [["State", status.state], ["Step", status.step], ["Cycle", status.cycle], ["Heartbeat", ago((Date.now()-Date.parse(status.heartbeat))/1000)], ["Running since", status.started]]);
+    const g = status.gpu || {};
+    kv($("machine"), [["GPU", g.name], ["GPU use", g.util_pct != null ? g.util_pct + " %" : null], ["VRAM", g.mem_used_mb != null ? `${(g.mem_used_mb/1024).toFixed(1)} / ${(g.mem_total_mb/1024).toFixed(0)} GB` : null], ["GPU temp", g.temp_c != null ? g.temp_c + " °C" : null], ["Disk free", status.disk_free_gb != null ? status.disk_free_gb + " GB" : null]]);
+    $("events").innerHTML = [...(status.events||[])].reverse().map(e => `<div class="e-${e.level}">${e.t} ${e.level.toUpperCase()} ${e.msg.replace(/</g,"&lt;")}</div>`).join("");
+    renderRuns(runs); renderMaps(runs);
+    $("loaded").textContent = "Last checked " + new Date().toLocaleTimeString() + ".";
+  } catch (e) {
+    $("lightcard").className = "card bad"; $("light").textContent = "Can't read status"; $("lightwhy").textContent = e.message;
+  }
+}
+refresh(); setInterval(refresh, 30000);
+</script>
+</body>
+</html>

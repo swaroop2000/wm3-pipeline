@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.env
+wm3.env
+*.npz
+*.nc
+*.pt
+.DS_Store
